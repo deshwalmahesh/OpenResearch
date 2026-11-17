@@ -8,7 +8,7 @@ orx keeps a researcher's work on their own machine. Projects, experiments, runs,
 | --- | --- | --- |
 | config | `$XDG_CONFIG_HOME/openresearch`, else `~/.config/openresearch` | `settings.json`, credentials for openresearch.sh, alphaXiv and Overleaf, the SSH hosts saved in orx (`ssh/`), the telemetry outbox, the locks that cover the data directory as a whole |
 | data | resolved below | `orx.db`, `repos/`, `worktrees/`, `agents/`, `run-logs/`, `files/`, `chat-attachments/`, per-run state |
-| cache | `ORX_CACHE_DIR`, the `cacheDir` setting, else `~/.cache/openresearch` | orx's managed agent copies, the model price list, the last model feed, and the legacy repository root, which [migrations](#migrations-follow-paths) empty |
+| cache | `ORX_CACHE_DIR`, the `cacheDir` setting, else `~/.cache/openresearch` | orx's managed agent copies, the model price list, the last model feed, papers' full text fetched by `orx paper` (`papers/`), and the legacy repository root, which [migrations](#migrations-follow-paths) empty |
 
 **The data directory is one relocatable unit.** Its location resolves, most to least authoritative, from `ORX_DATA_DIR`, the `dataDir` in `settings.json`, `$XDG_DATA_HOME/openresearch`, and `~/.local/share/openresearch`. The setting is read fresh on every resolution, so a process opening the store after a move sees the new place. The directory is owner-only because the store holds scoped compute capabilities. The desktop app imports these overrides from the login shell, or it and a terminal `orx` would open different databases ([desktop](desktop.md)).
 

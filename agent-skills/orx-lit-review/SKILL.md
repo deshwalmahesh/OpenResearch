@@ -202,7 +202,9 @@ exact wording and surrounding context, even when a report exists. Without
 `--full`, a missing report automatically falls back to extracted full text in the same
 command. `--full` skips the report entirely rather than acting as a superset of
 the default. If extracted text is also unavailable, locate the original PDF
-through the returned paper link.
+through the returned paper link. Extracted text is saved to a file rather than
+printed: the command prints the file's path, its size and the section titles it
+found, by line number. Read the line ranges you need, not the whole file.
 
 `orx paper` prints the alphaXiv link before the content. When alphaXiv has an
 associated repository, it then prints `GitHub: <url>`. This is the most-starred

@@ -16,6 +16,8 @@ mod engine_cli;
 mod invocation_gate_cli;
 #[path = "cli/logs_cli.rs"]
 mod logs_cli;
+#[path = "cli/paper_cli.rs"]
+mod paper_cli;
 #[path = "cli/up_auto_restart.rs"]
 mod up_auto_restart;
 #[path = "cli/up_sign_in.rs"]
