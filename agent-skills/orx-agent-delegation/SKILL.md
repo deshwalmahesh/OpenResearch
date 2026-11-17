@@ -21,7 +21,10 @@ ref (`msg_3fa9c1d2`) in the task instead of retyping it.
   parallel delegates separate files. `worktree: "own"` gives it a fresh
   worktree from the project's baseline; it is still your delegate, so it stays
   out of the sidebar. Commit first and name the commit in the task when it
-  should start from your work. Its changes never merge here automatically.
+  should start from your work. Its changes never merge here automatically:
+  have it commit and name the commit, then `git cherry-pick` it here before
+  the delegate is deleted, which removes its worktree and leaves the commit
+  unreachable.
 - **Independent chats.** `notify: false` starts a chat that is not your
   delegate: your side chat, or with `worktree: "own"` a top-level chat in the
   user's sidebar. Start a top-level chat only when the user asks for one. You
