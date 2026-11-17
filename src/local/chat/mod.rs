@@ -343,6 +343,19 @@ fn shell_hook_dir(session_id: &str) -> PathBuf {
         .join(safe_session_name(session_id))
 }
 
+/// Not under [`shell_hook_dir`]: that is the agents' `ZDOTDIR`.
+fn shell_output_dir(session_id: &str) -> PathBuf {
+    crate::store::data_dir()
+        .join("chat-shell-output")
+        .join(safe_session_name(session_id))
+}
+
+/// Where a composer `!` command's whole `stream` is kept once it outgrows what
+/// the next turn is shown. Derived from the ids, so no record stores it.
+fn shell_output_path(session_id: &str, message_id: &str, stream: &str) -> PathBuf {
+    shell_output_dir(session_id).join(format!("{}.{stream}", safe_session_name(message_id)))
+}
+
 fn target_event_start(session_id: &str, message_id: &str) -> (PathBuf, u64) {
     let path = target_event_path(session_id, message_id);
     let _ = std::fs::remove_file(&path);
@@ -634,6 +647,7 @@ pub fn cleanup_session_transcript_artifacts(session_id: &str) {
     }
     let _ = std::fs::remove_file(target_event_pointer(session_id));
     let _ = std::fs::remove_dir_all(shell_hook_dir(session_id));
+    let _ = std::fs::remove_dir_all(shell_output_dir(session_id));
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -1513,6 +1527,9 @@ struct ShellExchange {
     timed_out: bool,
     output: String,
     error: String,
+    /// The whole stdout/stderr and its size, when it outgrew `output`/`error`.
+    output_file: Option<(PathBuf, u64)>,
+    error_file: Option<(PathBuf, u64)>,
 }
 
 impl ShellExchange {
@@ -1556,6 +1573,8 @@ fn shell_exchange(message: &WireMessage) -> Option<ShellExchange> {
             .unwrap_or(false),
         output: state.output.clone().unwrap_or_default(),
         error: state.error.clone().unwrap_or_default(),
+        output_file: None,
+        error_file: None,
     })
 }
 
@@ -1573,7 +1592,21 @@ fn pending_shell_exchanges(store: &Store, leaf: Option<&str>) -> Result<Vec<Shel
         };
         let message = stored_to_wire(&stored);
         match shell_exchange(&message) {
-            Some(exchange) => exchanges.push(exchange),
+            Some(mut exchange) => {
+                // The spool starts by bytes, the cap cuts by characters, so a
+                // file is named only when the shown text was really cut.
+                let kept = |stream, shown: &str| {
+                    if !shown.contains(TOOL_TEXT_TRUNCATION_MARKER) {
+                        return None;
+                    }
+                    let path = shell_output_path(&stored.session_id, &stored.id, stream);
+                    let len = std::fs::metadata(&path).ok()?.len();
+                    Some((path, len))
+                };
+                exchange.output_file = kept("stdout", &exchange.output);
+                exchange.error_file = kept("stderr", &exchange.error);
+                exchanges.push(exchange);
+            }
             None if at_leaf && message.role == "user" => {}
             None => break,
         }
@@ -1600,11 +1633,22 @@ fn shell_context(exchanges: &[ShellExchange]) -> Option<String> {
             exchange.status(),
             exchange.command
         ));
-        if !exchange.output.is_empty() {
-            context.push_str(&format!("<stdout>\n{}\n</stdout>\n", exchange.output));
-        }
-        if !exchange.error.is_empty() {
-            context.push_str(&format!("<stderr>\n{}\n</stderr>\n", exchange.error));
+        for (stream, text, file) in [
+            ("stdout", &exchange.output, &exchange.output_file),
+            ("stderr", &exchange.error, &exchange.error_file),
+        ] {
+            if !text.is_empty() {
+                context.push_str(&format!("<{stream}>\n{text}\n</{stream}>\n"));
+            }
+            // The path stays on a line of its own: spliced into a command, a
+            // space in it would split the argument.
+            if let Some((path, len)) = file {
+                context.push_str(&format!(
+                    "The {stream} above is cut short. All {len} bytes of it are saved at:\n{}\n\
+                     Read its end with `tail` or search it with `grep -n`, quoting the path.\n",
+                    path.display()
+                ));
+            }
         }
     }
     context.push_str("</user-shell-commands>");
@@ -1614,22 +1658,78 @@ fn shell_context(exchanges: &[ShellExchange]) -> Option<String> {
 /// What a child has printed so far, readable before its pipe closes.
 type ShellStream = Arc<std::sync::Mutex<Vec<u8>>>;
 
+const SHELL_READ_CHUNK: usize = 8192;
+// The spool opens within the first `SHELL_STREAM_BYTES`, so `kept` still holds
+// everything printed before it.
+const _: () = assert!(TOOL_TEXT_CAP + SHELL_READ_CHUNK <= SHELL_STREAM_BYTES);
+
 /// Drain a child's pipe to the end, keeping the first `SHELL_STREAM_BYTES`.
 /// Reading on past the cap keeps a chatty child from blocking on a full pipe.
-async fn read_shell_stream<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, kept: ShellStream) {
-    use tokio::io::AsyncReadExt as _;
+/// Once the stream outgrows what `cap_tool_text` keeps, all of it also goes
+/// to `spool`, so the next turn can read what the cap left out.
+async fn read_shell_stream<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+    kept: ShellStream,
+    spool: PathBuf,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let Some(mut pipe) = pipe else {
         return;
     };
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; SHELL_READ_CHUNK];
+    let mut total = 0;
+    let mut file: Option<tokio::fs::File> = None;
+    let mut spooling = true;
     while let Ok(n) = pipe.read(&mut chunk).await {
         if n == 0 {
             break;
         }
-        let mut kept = kept.lock().unwrap();
-        let room = SHELL_STREAM_BYTES.saturating_sub(kept.len());
-        kept.extend_from_slice(&chunk[..n.min(room)]);
+        total += n;
+        let head = {
+            let mut kept = kept.lock().unwrap();
+            let room = SHELL_STREAM_BYTES.saturating_sub(kept.len());
+            kept.extend_from_slice(&chunk[..n.min(room)]);
+            (spooling && file.is_none() && total > TOOL_TEXT_CAP).then(|| kept.clone())
+        };
+        let written = match head {
+            Some(head) => open_shell_spool(&spool, &head)
+                .await
+                .map(|opened| file = Some(opened)),
+            None => match file.as_mut() {
+                Some(file) => file.write_all(&chunk[..n]).await,
+                None => Ok(()),
+            },
+        };
+        if let Err(error) = written {
+            spooling = false;
+            file = None;
+            drop_shell_spool(&spool, error).await;
+        }
     }
+    if let Some(mut file) = file {
+        if let Err(error) = file.flush().await {
+            drop_shell_spool(&spool, error).await;
+        }
+    }
+}
+
+/// A partial file would read as the whole output, so a failed one goes.
+async fn drop_shell_spool(path: &std::path::Path, error: std::io::Error) {
+    eprintln!(
+        "orx up: could not keep the full output of a composer command at {}: {error}",
+        path.display()
+    );
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+async fn open_shell_spool(path: &std::path::Path, head: &[u8]) -> std::io::Result<tokio::fs::File> {
+    use tokio::io::AsyncWriteExt as _;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(head).await?;
+    Ok(file)
 }
 
 /// Kill the command's whole process group: a pipeline or a backgrounded
@@ -1977,9 +2077,13 @@ mod windows_agent_tree_tests {
 /// chatty command never blocks on a full pipe while we wait for it.
 fn drain_shell_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     pipe: Option<R>,
+    spool: PathBuf,
 ) -> (tokio::task::JoinHandle<()>, ShellStream) {
     let kept = ShellStream::default();
-    (tokio::spawn(read_shell_stream(pipe, kept.clone())), kept)
+    (
+        tokio::spawn(read_shell_stream(pipe, kept.clone(), spool)),
+        kept,
+    )
 }
 
 /// The stream's text once the pipe closes, or whatever had arrived when the
@@ -2425,6 +2529,8 @@ impl ChatHost {
         ) {
             spawn.env("PATH", path);
         }
+        // Named before the run: its spooled output files are named after it.
+        let message_id = format!("msg_{}", uuid::Uuid::new_v4());
         let mut exit_code = None;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut signal: Option<i64> = None;
@@ -2436,8 +2542,14 @@ impl ChatHost {
             ),
             Ok(mut child) => {
                 let pid = child.id();
-                let stdout = drain_shell_stream(child.stdout.take());
-                let stderr = drain_shell_stream(child.stderr.take());
+                let stdout = drain_shell_stream(
+                    child.stdout.take(),
+                    shell_output_path(session_id, &message_id, "stdout"),
+                );
+                let stderr = drain_shell_stream(
+                    child.stderr.take(),
+                    shell_output_path(session_id, &message_id, "stderr"),
+                );
                 let status = tokio::time::timeout(SHELL_COMMAND_TIMEOUT, child.wait()).await;
                 if status.is_err() {
                     timed_out = true;
@@ -2496,6 +2608,10 @@ impl ChatHost {
             session,
             self.deleting_sessions.lock().unwrap().contains(session_id),
         ) else {
+            // The chat's cleanup may have run before these were written.
+            for stream in ["stdout", "stderr"] {
+                let _ = std::fs::remove_file(shell_output_path(session_id, &message_id, stream));
+            }
             return Err(anyhow!("chat session is gone"));
         };
         // Activity unarchives, as sending does.
@@ -2503,7 +2619,7 @@ impl ChatHost {
             store.set_chat_session_archived(session_id, false)?;
         }
         let mut message = WireMessage {
-            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            id: message_id,
             role: "user".into(),
             parts: vec![part],
             created_at: now_ms(),
@@ -2635,6 +2751,102 @@ mod shell_command_tests {
         assert!(turn.ends_with("<current-user-message>\nwhy?\n</current-user-message>"));
         assert!(shell_context(&[]).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn only_output_past_the_cap_is_spooled_and_a_failed_spool_leaves_no_file() {
+        let dir = std::env::temp_dir().join(format!("orx-spool-{}", uuid::Uuid::new_v4()));
+        let read = |input: Vec<u8>, spool: std::path::PathBuf| async move {
+            let kept = super::ShellStream::default();
+            super::read_shell_stream(Some(input.as_slice()), kept.clone(), spool).await;
+            let kept = kept.lock().unwrap().clone();
+            kept
+        };
+
+        let short = dir.join("short");
+        assert_eq!(read(b"done\n".to_vec(), short.clone()).await, b"done\n");
+        assert!(!short.exists());
+
+        let long: Vec<u8> = (0..200_000).map(|i| b'a' + (i % 26) as u8).collect();
+        let spooled = dir.join("long");
+        let kept = read(long.clone(), spooled.clone()).await;
+        assert_eq!(kept, long[..super::SHELL_STREAM_BYTES]);
+        assert_eq!(std::fs::read(&spooled).unwrap(), long);
+
+        // A file where the spool's directory should be makes the spool fail.
+        std::fs::write(dir.join("blocked"), b"").unwrap();
+        let failed = dir.join("blocked").join("out");
+        let kept = read(long.clone(), failed.clone()).await;
+        assert_eq!(kept, long[..super::SHELL_STREAM_BYTES]);
+        assert!(!failed.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A traceback printed after a long output is past what the next turn is
+    /// shown, so the turn is told where the whole output is kept.
+    #[tokio::test]
+    async fn the_end_of_a_long_command_stays_reachable_from_the_next_turn() {
+        use crate::store::StoredChatSession;
+        use std::sync::Arc;
+
+        let session_id = format!("shell-{}", uuid::Uuid::new_v4());
+        let store = Store::open().unwrap();
+        store
+            .create_chat_session(&StoredChatSession {
+                id: session_id.clone(),
+                ..super::bridge_tests::bare_session()
+            })
+            .unwrap();
+        let host = Arc::new(super::ChatHost::new(
+            Arc::new(super::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        let message = host
+            .run_shell_command(
+                &session_id,
+                // The marker is computed so the command text itself never contains it.
+                "head -c 100000 /dev/zero | tr '\\0' a; echo; echo TRACE_$((40 + 2))".into(),
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+        let state = message.parts[0].state.as_ref().unwrap();
+        if state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("could not start bash"))
+        {
+            crate::config::skip_without_tool("bash");
+            return;
+        }
+
+        let context =
+            shell_context(&pending_shell_exchanges(&store, Some(&message.id)).unwrap()).unwrap();
+        assert!(!context.contains("TRACE_42"), "the shown text is capped");
+        let saved = super::shell_output_path(&session_id, &message.id, "stdout");
+        assert!(context.contains(&saved.display().to_string()), "{context}");
+        let whole = std::fs::read(&saved).unwrap();
+        assert_eq!(whole.len(), 100_010);
+        assert!(whole.ends_with(b"\nTRACE_42\n"));
+        assert!(!super::shell_output_path(&session_id, &message.id, "stderr").exists());
+
+        // Over the cap in bytes but not in characters: shown whole, so no pointer.
+        let wide = host
+            .run_shell_command(
+                &session_id,
+                "printf '漢%.0s' {1..8000}".into(),
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+        let context =
+            shell_context(&pending_shell_exchanges(&store, Some(&wide.id)).unwrap()).unwrap();
+        // Both commands are in this context; only the first one was cut.
+        assert_eq!(context.matches("saved at").count(), 1, "{context}");
+
+        super::cleanup_session_transcript_artifacts(&session_id);
+        assert!(!super::shell_output_dir(&session_id).exists());
     }
 }
 
@@ -11859,7 +12071,7 @@ mod bridge_tests {
         assert_eq!(prompt.approved, Some(true));
     }
 
-    fn bare_session() -> StoredChatSession {
+    pub(super) fn bare_session() -> StoredChatSession {
         StoredChatSession {
             profile_id: None,
             id: "chat_1".into(),
